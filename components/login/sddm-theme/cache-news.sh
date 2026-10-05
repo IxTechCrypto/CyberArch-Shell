@@ -1,56 +1,63 @@
 #!/usr/bin/env bash
 # cache-news.sh — fetches BBC + Google News RSS, writes headlines to /tmp/cyberpunk-news-cache.json
 # run via cron: */10 * * * * ~/.config/hypr/themes/cyberpunk/components/login/sddm-theme/cache-news.sh
+#
+# feed text is untrusted: it only ever reaches python as file contents, never as shell or code
 
 CACHE="/tmp/cyberpunk-news-cache.json"
 CITY_FILE="$HOME/.config/cyberarch/city.json"
 [ -r "$CITY_FILE" ] || CITY_FILE="$HOME/.config/hypr/themes/cyberpunk/config/city.json"
 
-strip_tags() { sed 's/<[^>]*>//g'; }
+WORK="$(mktemp -d)" || exit 1
+trap 'rm -rf "$WORK"' EXIT
 
-decode_entities() {
-  sed -E 's/<!\[CDATA\[([^]]*)\]\]>/\1/g;
-          s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g;
-          s/&quot;/"/g; s/&#39;/'"'"'/g; s/&apos;/'"'"'/g;
-          s/&nbsp;/ /g; s/&rsquo;/'"'"'/g; s/&lsquo;/'"'"'/g;
-          s/&rdquo;/"/g; s/&ldquo;/"/g;
-          s/&ndash;/-/g; s/&mdash;/-/g; s/&hellip;/.../g;
-          s/&#x([0-9a-fA-F]+);/printf "\\x\1"/ge;
-          s/&#([0-9]+);/printf "\\x\1"/ge'
-}
-
-extract_titles() {
-  grep -oP '<(item|entry)\b[\s\S]*?</\1>' | \
-    grep -oP '<title[^>]*>\K[\s\S]*?(?=</title>)' | \
-    strip_tags | decode_entities | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | \
-    grep -v '^$' | head -7
-}
-
-city="US"
-if [ -f "$CITY_FILE" ]; then
-  city_full=$(python3 -c "import json,sys; d=json.load(open('$CITY_FILE')); print(d.get('full',''))" 2>/dev/null || echo "")
-  city_name=$(python3 -c "import json,sys; d=json.load(open('$CITY_FILE')); print(d.get('name',''))" 2>/dev/null || echo "")
-  city="${city_full:-${city_name:-US}}"
-fi
+city="$(python3 - "$CITY_FILE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("full") or d.get("name") or "US")
+except Exception:
+    print("US")
+PY
+)"
+[ -n "$city" ] || city="US"
 
 global_url="https://feeds.bbci.co.uk/news/world/rss.xml"
-local_url="https://news.google.com/rss/search?q=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${city} news when:2d'))")&hl=en-US&gl=US&ceid=US:en"
+local_url="https://news.google.com/rss/search?q=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1] + " news when:2d"))' "$city")&hl=en-US&gl=US&ceid=US:en"
 
-global_titles=$(curl -sfL --max-time 8 -H "User-Agent: Mozilla/5.0" "$global_url" | extract_titles)
-local_titles=$(curl -sfL --max-time 8 -H "User-Agent: Mozilla/5.0" "$local_url" | extract_titles)
+curl -sfL --max-time 8 -H "User-Agent: Mozilla/5.0" -o "$WORK/global.xml" "$global_url"
+curl -sfL --max-time 8 -H "User-Agent: Mozilla/5.0" -o "$WORK/local.xml" "$local_url"
 
-headlines="[]"
-if [ -n "$global_titles" ] || [ -n "$local_titles" ]; then
-  headlines=$(python3 -c "
-import json, sys
-g = '''$global_titles'''.strip().split('\n') if '''$global_titles'''.strip() else []
-l = '''$local_titles'''.strip().split('\n') if '''$local_titles'''.strip() else []
+python3 - "$WORK/global.xml" "$WORK/local.xml" "$WORK/out.json" <<'PY' 2>/dev/null
+import html, json, re, sys
+
+def titles(path):
+    try:
+        raw = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return []
+    out = []
+    for block in re.finditer(r"<(item|entry)\b.*?</\1>", raw, re.S):
+        m = re.search(r"<title[^>]*>(.*?)</title>", block.group(0), re.S)
+        if not m:
+            continue
+        t = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", m.group(1), flags=re.S)
+        t = re.sub(r"<[^>]*>", "", t)
+        t = " ".join(html.unescape(t).split())
+        if t:
+            out.append(t)
+        if len(out) == 7:
+            break
+    return out
+
+g, l = titles(sys.argv[1]), titles(sys.argv[2])
 mixed = []
 for i in range(max(len(g), len(l))):
-    if i < len(g) and g[i].strip(): mixed.append(g[i].strip())
-    if i < len(l) and l[i].strip(): mixed.append(l[i].strip())
-print(json.dumps(mixed[:14]))
-" 2>/dev/null || echo "[]")
-fi
+    if i < len(g): mixed.append(g[i])
+    if i < len(l): mixed.append(l[i])
+with open(sys.argv[3], "w", encoding="utf-8") as f:
+    json.dump(mixed[:14], f, ensure_ascii=False)
+PY
 
-echo "$headlines" > "$CACHE"
+[ -s "$WORK/out.json" ] || echo "[]" > "$WORK/out.json"
+cp -f "$WORK/out.json" "$CACHE"

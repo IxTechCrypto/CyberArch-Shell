@@ -76,7 +76,17 @@ pac_install() {
   local label="$1"; shift
   [ "$#" -eq 0 ] && return 0
   if sudo pacman -S --needed "$@"; then ok "$label installed"; return 0; fi
-  warn "batch transaction flatlined |::| retrying $label one chip at a time"
+  # pacman exits 1 both on a real error and when you answer N at its prompt, so
+  # never fall through to --noconfirm without asking again
+  local ans=""
+  printf "  ${CYAN}?${R} pacman did not finish %s. Retry one package at a time without prompts? (y/N) " "$label"
+  read -r ans </dev/tty 2>/dev/null || ans=""
+  case "$ans" in
+    [yY]*) warn "batch transaction flatlined |::| retrying $label one chip at a time" ;;
+    *) fatal "$label not installed |::| declined, or pacman failed and no retry was approved." \
+         "Install them yourself:  sudo pacman -S --needed $*" \
+         "Then re-run:  ./install.sh" ;;
+  esac
   local failed=() p
   for p in "$@"; do
     sudo pacman -S --needed --noconfirm "$p" >/dev/null 2>&1 || failed+=("$p")
@@ -704,11 +714,15 @@ read -r ans </dev/tty
 if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
   HOOKSRC="$THEME/assets/pacman/cyberpunk-pkg-notify.hook"
   HOOKDST="/etc/pacman.d/hooks/cyberpunk-pkg-notify.hook"
+  # the hook runs as root, so it execs a root-owned copy, never the user-writable clone
+  NOTIFYDST="/usr/local/lib/cyberarch/pkg-notify"
   if [ -f "$HOOKSRC" ]; then
-    if sed "s|__THEME__|$CANON|g" "$HOOKSRC" | sudo tee "$HOOKDST" >/dev/null 2>&1; then
-      ok "install-notification hook → $HOOKDST"
+    if sudo install -D -m 755 -o root -g root "$THEME/scripts/pkg-notify" "$NOTIFYDST" \
+       && sudo install -d -m 755 "$(dirname "$HOOKDST")" \
+       && sed "s|__PKG_NOTIFY__|$NOTIFYDST|g" "$HOOKSRC" | sudo tee "$HOOKDST" >/dev/null 2>&1; then
+      ok "install-notification hook → $HOOKDST (runs $NOTIFYDST)"
     else
-      warn "hook not installed (needs root) |::| run: sed \"s|__THEME__|$CANON|g\" \"$HOOKSRC\" | sudo tee \"$HOOKDST\""
+      warn "hook not installed (needs root) |::| run: sudo install -D -m 755 -o root -g root \"$THEME/scripts/pkg-notify\" $NOTIFYDST && sed \"s|__PKG_NOTIFY__|$NOTIFYDST|g\" \"$HOOKSRC\" | sudo tee \"$HOOKDST\""
     fi
   else
     warn "hook template missing at $HOOKSRC"
